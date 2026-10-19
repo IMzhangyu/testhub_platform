@@ -13,6 +13,7 @@ from django.views.static import serve
 from django.conf import settings
 from django.views.decorators.csrf import csrf_exempt
 import requests
+from apps.core.ai_endpoints import post_with_endpoint_fallback
 import time
 import os
 import json
@@ -2430,12 +2431,7 @@ class AIServiceConfigViewSet(viewsets.ModelViewSet):
                 'max_tokens': 10
             }
 
-            response = requests.post(
-                f"{config.base_url}/chat/completions",
-                headers=headers,
-                json=test_data,
-                timeout=10
-            )
+            _, response = post_with_endpoint_fallback(config.base_url, test_data, headers, 10)
 
             if response.status_code == 200:
                 return Response({'message': '连接测试成功', 'status': 'success'})
@@ -2531,12 +2527,7 @@ URL参数:
                 'temperature': config.temperature
             }
 
-            response = requests.post(
-                f"{config.base_url}/chat/completions",
-                headers=headers,
-                json=ai_data,
-                timeout=30
-            )
+            _, response = post_with_endpoint_fallback(config.base_url, ai_data, headers, 30)
 
             if response.status_code == 200:
                 result = response.json()
@@ -2603,12 +2594,7 @@ URL参数:
                 'temperature': config.temperature
             }
 
-            response = requests.post(
-                f"{config.base_url}/chat/completions",
-                headers=headers,
-                json=ai_data,
-                timeout=30
-            )
+            _, response = post_with_endpoint_fallback(config.base_url, ai_data, headers, 30)
 
             if response.status_code == 200:
                 result = response.json()
@@ -2679,12 +2665,7 @@ URL参数:
                 'temperature': config.temperature
             }
 
-            response = requests.post(
-                f"{config.base_url}/chat/completions",
-                headers=headers,
-                json=ai_data,
-                timeout=30
-            )
+            _, response = post_with_endpoint_fallback(config.base_url, ai_data, headers, 30)
 
             if response.status_code == 200:
                 result = response.json()
@@ -2766,12 +2747,7 @@ URL参数: {json.dumps(request_data['params'], ensure_ascii=False)}
                 'temperature': config.temperature
             }
 
-            response = requests.post(
-                f"{config.base_url}/chat/completions",
-                headers=headers,
-                json=ai_data,
-                timeout=30
-            )
+            _, response = post_with_endpoint_fallback(config.base_url, ai_data, headers, 30)
 
             if response.status_code == 200:
                 result = response.json()

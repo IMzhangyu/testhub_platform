@@ -196,6 +196,7 @@ class EnvironmentConfigViewSet(viewsets.ViewSet):
 
 
 import requests
+from apps.core.ai_endpoints import post_with_endpoint_fallback
 from apps.requirement_analysis.models import AIModelConfig
 
 class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
@@ -387,6 +388,13 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        # 智能体运行时统一用 ChatOpenAI 直连，Anthropic 原生协议（/v1/messages）走不通
+        if provider == 'anthropic':
+            return Response(
+                {'error': 'AI智能模式仅支持 OpenAI 兼容协议，Anthropic 原生协议请改用其兼容端点'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         # 默认Base URL处理
         if not base_url:
             if provider == 'openai':
@@ -395,8 +403,6 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                 base_url = 'https://api.siliconflow.cn/v1'
             elif provider == 'deepseek':
                 base_url = 'https://api.deepseek.com'
-            elif provider == 'anthropic':
-                base_url = 'https://api.anthropic.com'
 
         if not base_url:
              return Response(
@@ -404,11 +410,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                  status=status.HTTP_400_BAD_REQUEST
              )
 
-        base_url = base_url.rstrip('/')
-
         try:
-            # 尝试调用 chat completions 接口 (OpenAI Compatible)
-            url = f"{base_url}/chat/completions"
             headers = {
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json"
@@ -420,11 +422,10 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                 "max_tokens": 1
             }
 
-            logger.info(f"AI智能模式预览 - 发送POST请求到: {url}")
             # 增加超时时间：连接超时60秒，读取超时900秒
-            response = requests.post(url, headers=headers, json=data, timeout=(60, 900))
+            url, response = post_with_endpoint_fallback(base_url, data, headers, (60, 900))
 
-            logger.info(f"AI智能模式预览 - 收到响应: status_code={response.status_code}")
+            logger.info(f"AI智能模式预览 - 收到响应: status_code={response.status_code}, URL={url}")
 
             if response.status_code == 200:
                 return Response({'message': '连接成功'})
@@ -466,6 +467,13 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
         logger.info(f"API URL: {config.base_url}")
         logger.info(f"API Key前缀: {config.api_key[:10]}..." if len(config.api_key) > 10 else f"API Key: {config.api_key}")
 
+        if config.model_type == 'anthropic':
+            # 智能体运行时统一用 ChatOpenAI 直连，Anthropic 原生协议（/v1/messages）走不通
+            return Response(
+                {'error': 'AI智能模式仅支持 OpenAI 兼容协议，Anthropic 原生协议请改用其兼容端点'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
         base_url = config.base_url
         if not base_url:
             # 使用默认Base URL
@@ -476,8 +484,6 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                 base_url = 'https://api.siliconflow.cn/v1'
             elif provider == 'deepseek':
                 base_url = 'https://api.deepseek.com'
-            elif provider == 'anthropic':
-                base_url = 'https://api.anthropic.com'
 
         if not base_url:
             return Response(
@@ -485,10 +491,7 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        base_url = base_url.rstrip('/')
-
         try:
-            url = f"{base_url}/chat/completions"
             headers = {
                 "Authorization": f"Bearer {config.api_key}",
                 "Content-Type": "application/json"
@@ -500,11 +503,10 @@ class AIIntelligentModeConfigViewSet(viewsets.ViewSet):
                 "max_tokens": 1
             }
 
-            logger.info(f"AI智能模式 - 发送POST请求到: {url}")
             # 增加超时时间：连接超时60秒，读取超时900秒
-            response = requests.post(url, headers=headers, json=data, timeout=(60, 900))
+            url, response = post_with_endpoint_fallback(base_url, data, headers, (60, 900))
 
-            logger.info(f"AI智能模式 - 收到响应: status_code={response.status_code}")
+            logger.info(f"AI智能模式 - 收到响应: status_code={response.status_code}, URL={url}")
 
             if response.status_code == 200:
                 logger.info("AI智能模式 - API连接测试成功")
