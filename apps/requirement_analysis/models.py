@@ -3,6 +3,7 @@ from django.utils import timezone
 from apps.users.models import User
 from apps.projects.models import Project
 import json
+import re
 import httpx
 import asyncio
 from typing import Dict, Any, List, AsyncIterator
@@ -441,24 +442,53 @@ class AIModelService:
         }
 
     @staticmethod
-    def build_openai_compatible_url(base_url: str, endpoint: str) -> str:
-        """根据用户输入的 base_url 构建 OpenAI 兼容接口地址。"""
+    def build_openai_compatible_urls(base_url: str, endpoint: str) -> List[str]:
+        """根据用户输入的 base_url 构建 OpenAI 兼容接口地址候选列表（按优先级排序）。
+
+        部分厂商的 base_url 路径中间已带版本号（如百度千帆 Token Plan 的
+        https://qianfan.baidubce.com/v2/tokenplan/personal），其接口并不挂在 /v1 下，
+        而且不同接口的拼法还不一致，因此保留另一种拼法作为 404 兜底。
+        """
         normalized_base_url = base_url.rstrip('/')
 
         if normalized_base_url.endswith(endpoint):
-            return normalized_base_url
+            return [normalized_base_url]
 
         for known_endpoint in ('/chat/completions', '/models'):
             if normalized_base_url.endswith(known_endpoint):
                 normalized_base_url = normalized_base_url[:-len(known_endpoint)]
                 break
 
-        import re
-        version_match = re.search(r'/v(\d+)/?$', normalized_base_url)
-        if version_match:
-            return f"{normalized_base_url}{endpoint}"
+        direct_url = f"{normalized_base_url}{endpoint}"
+        v1_url = f"{normalized_base_url}/v1{endpoint}"
 
-        return f"{normalized_base_url}/v1{endpoint}"
+        # base_url 以版本号结尾（如 /v1、/v4）时，直接拼接即可
+        if re.search(r'/v\d+/?$', normalized_base_url):
+            return [direct_url]
+        # 版本号出现在路径中间（如 /v2/tokenplan/personal）时，优先直接拼接，/v1 兜底
+        if re.search(r'/v\d+/', normalized_base_url):
+            return [direct_url, v1_url]
+
+        return [v1_url, direct_url]
+
+    @staticmethod
+    async def send_with_endpoint_fallback(client: httpx.AsyncClient, method: str, base_url: str,
+                                          endpoint: str, headers: Dict[str, str], **kwargs):
+        """按候选地址依次请求，仅当返回 404 且仍有备用地址时才更换地址。"""
+        candidates = AIModelService.build_openai_compatible_urls(base_url, endpoint)
+        url = candidates[0]
+        response = None
+
+        for index, candidate_url in enumerate(candidates):
+            url = candidate_url
+            logger.info(f"发送{method}请求到: {url}")
+            response = await client.request(method, url, headers=headers, **kwargs)
+            if response.status_code == 404 and index + 1 < len(candidates):
+                logger.warning(f"接口地址 {url} 返回404，改用备用地址重试")
+                continue
+            break
+
+        return url, response
 
     @staticmethod
     async def call_openai_compatible_api(
@@ -491,11 +521,11 @@ class AIModelService:
             'stream': False
         }
 
-        url = AIModelService.build_openai_compatible_url(config.base_url, '/chat/completions')
+        url_candidates = AIModelService.build_openai_compatible_urls(config.base_url, '/chat/completions')
 
         logger.info(f"=== API调用详情 ===")
         logger.info(f"原始base_url: {config.base_url}")
-        logger.info(f"最终请求URL: {url}")
+        logger.info(f"候选请求URL: {url_candidates}")
         logger.info(f"模型名称: {config.model_name}")
         logger.info(f"请求参数: max_tokens={actual_max_tokens}, temperature={config.temperature}, top_p={config.top_p}")
 
@@ -510,14 +540,11 @@ class AIModelService:
                 pool=60.0  # 连接池超时：60秒
             )
             async with httpx.AsyncClient(timeout=timeout_config, http2=False) as client:
-                logger.info(f"发送POST请求到: {url}")
-                response = await client.post(
-                    url,
-                    headers=headers,
-                    json=data
+                url, response = await AIModelService.send_with_endpoint_fallback(
+                    client, 'POST', config.base_url, '/chat/completions', headers, json=data
                 )
 
-                logger.info(f"收到响应: status_code={response.status_code}")
+                logger.info(f"收到响应: status_code={response.status_code}, URL={url}")
 
                 if response.status_code != 200:
                     error_detail = response.text
@@ -546,7 +573,6 @@ class AIModelService:
     async def list_available_models(config: AIModelConfig) -> List[str]:
         """获取当前配置下可用的模型列表。"""
         headers = AIModelService.get_openai_compatible_headers(config.api_key)
-        url = AIModelService.build_openai_compatible_url(config.base_url, '/models')
 
         timeout_config = httpx.Timeout(
             connect=30.0,
@@ -557,9 +583,10 @@ class AIModelService:
 
         try:
             async with httpx.AsyncClient(timeout=timeout_config, http2=False) as client:
-                logger.info(f"获取模型列表，URL: {url}")
-                response = await client.get(url, headers=headers)
-
+                url, response = await AIModelService.send_with_endpoint_fallback(
+                    client, 'GET', config.base_url, '/models', headers
+                )
+                logger.info(f"获取模型列表响应: status={response.status_code}, URL={url}")
                 if response.status_code != 200:
                     error_detail = response.text
                     logger.error(f"获取模型列表失败: Status={response.status_code}, Body={error_detail}")
@@ -621,20 +648,8 @@ class AIModelService:
         # 使用传入的max_tokens或默认使用config.max_tokens
         actual_max_tokens = max_tokens if max_tokens is not None else config.max_tokens
 
-        # 确保base_url不以/结尾
-        base_url = config.base_url.rstrip('/')
-        if not base_url.endswith('/chat/completions'):
-            # 检查是否已经包含版本号（如v1, v4等）
-            import re
-            version_match = re.search(r'/v(\d+)/?$', base_url)
-            if version_match:
-                # 如果已经以版本号结尾（如/v1, /v4），直接添加/chat/completions
-                url = f"{base_url}/chat/completions"
-            else:
-                # 默认假设是根路径，尝试添加 v1/chat/completions
-                url = f"{base_url}/v1/chat/completions"
-        else:
-            url = base_url
+        url_candidates = AIModelService.build_openai_compatible_urls(config.base_url, '/chat/completions')
+        logger.info(f"流式请求候选URL: {url_candidates}")
 
         # 续写控制
         current_messages = list(messages)  # 浅拷贝
@@ -665,13 +680,25 @@ class AIModelService:
                     pool=60.0  # 连接池超时：60秒
                 )
                 async with httpx.AsyncClient(timeout=timeout_config, http2=False) as client:
-                    async with client.stream('POST', url, headers=headers, json=data) as response:
-                        if response.status_code != 200:
-                            error_detail = await response.aread()
-                            error_msg = error_detail.decode('utf-8')
-                            logger.error(f"流式API调用返回错误: Status={response.status_code}, Body={error_msg}")
-                            response.raise_for_status()
+                    for index, candidate_url in enumerate(url_candidates):
+                        url = candidate_url
+                        logger.info(f"发起流式POST请求到: {url}")
+                        request = client.build_request('POST', url, headers=headers, json=data)
+                        response = await client.send(request, stream=True)
+                        if response.status_code == 404 and index + 1 < len(url_candidates):
+                            logger.warning(f"接口地址 {url} 返回404，改用备用地址重试")
+                            await response.aclose()
+                            continue
+                        break
 
+                    if response.status_code != 200:
+                        error_detail = await response.aread()
+                        error_msg = error_detail.decode('utf-8')
+                        logger.error(f"流式API调用返回错误: Status={response.status_code}, Body={error_msg}")
+                        await response.aclose()
+                        response.raise_for_status()
+
+                    try:
                         async for line in response.aiter_lines():
                             if not line.strip():
                                 continue
@@ -701,6 +728,8 @@ class AIModelService:
 
                                 except json.JSONDecodeError:
                                     continue
+                    finally:
+                        await response.aclose()
 
                 # 本次请求结束
                 # 检查 finish_reason
